@@ -1,11 +1,15 @@
 """
-LinkedIn Saved Posts AI Agent
-─────────────────────────────
-Uses Playwright + Claude vision to scroll through your saved posts,
-extract everything, and dump clean JSON — just like Manus AI.
+LinkedIn Saved Posts Agent — v2
+────────────────────────────────
+Strategy:
+  1. Open /my-items/saved-posts/
+  2. Find every post link on the page via JS + Claude vision fallback
+  3. Open each post URL in a new tab, extract content, close tab
+  4. Scroll saved-posts list, repeat until posts > 30 days old
+  5. Claude cleans + categorises everything at the end
 
 SETUP:
-  pip install playwright anthropic python-dotenv
+  pip install playwright anthropic
   playwright install chromium
 
 RUN:
@@ -22,339 +26,379 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from anthropic import Anthropic
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # or hardcode temporarily
-MODEL = "claude-opus-4-5"
-LOOKBACK_DAYS = 30          # stop scrolling past posts older than this
-MAX_SCROLL_STEPS = 120      # safety cap
-OUTPUT_FILE = f"linkedin_saved_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+MODEL             = "claude-opus-4-5"
+LOOKBACK_DAYS     = 30
+MAX_POSTS         = 100       # hard cap so you don't accidentally scrape forever
+OUTPUT_FILE       = f"linkedin_saved_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+SESSION_FILE      = "linkedin_session.json"   # persisted login — delete to force re-login
+PARALLEL_TABS     = 10                        # simultaneous post tabs
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── Screenshot helper ─────────────────────────────────────────────────────────
-async def screenshot_b64(page) -> str:
-    png = await page.screenshot(full_page=False)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def b64(png: bytes) -> str:
     return base64.standard_b64encode(png).decode()
 
-# ── Claude vision call ────────────────────────────────────────────────────────
-def ask_claude_vision(screenshot_b64: str, prompt: str) -> str:
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": screenshot_b64,
-                    },
-                },
-                {"type": "text", "text": prompt},
-            ],
-        }],
+def claude_vision(img_b64: str, prompt: str) -> str:
+    r = client.messages.create(
+        model=MODEL, max_tokens=1024,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+            {"type": "text", "text": prompt},
+        ]}],
     )
-    return resp.content[0].text.strip()
+    return r.content[0].text.strip()
 
-# ── Extract posts from current DOM via JS ─────────────────────────────────────
-EXTRACT_JS = """
+async def safe_goto(page, url: str, timeout=20000):
+    """Navigate without crashing on LinkedIn self-redirects."""
+    try:
+        await page.goto(url, wait_until="load", timeout=timeout)
+    except PWTimeout:
+        pass
+    except Exception as e:
+        if "interrupted by another navigation" in str(e):
+            pass
+        else:
+            raise
+    await asyncio.sleep(2)
+
+# ── JS: collect all post links visible on saved-posts page ───────────────────
+COLLECT_LINKS_JS = """
 () => {
-  const posts = [];
-  const selectors = [
-    '.scaffold-finite-scroll__content .occludable-update',
-    '.feed-shared-update-v2',
-    '[data-urn*="activity"]',
-  ];
+    const results = [];
+    const seen = new Set();
 
-  let containers = [];
-  for (const sel of selectors) {
-    const els = [...document.querySelectorAll(sel)];
-    if (els.length > 0) { containers = els; break; }
-  }
+    const candidates = [
+        ...document.querySelectorAll('a[href*="/feed/update/"]'),
+        ...document.querySelectorAll('a[href*="/posts/"]'),
+    ];
 
-  // dedupe
-  containers = [...new Set(containers)];
+    for (const a of candidates) {
+        const href = a.href || '';
+        if (!href || seen.has(href)) continue;
 
-  containers.forEach((el, i) => {
-    try {
-      const textEl = el.querySelector('.feed-shared-text, .update-components-text, [class*="commentary"]');
-      const text = textEl ? textEl.innerText.trim() : '';
+        // Skip nav/sidebar links
+        if (href.includes('/mynetwork') || href.includes('/jobs') ||
+            href.includes('/messaging') || href.includes('/notifications')) continue;
 
-      const authorEl = el.querySelector('.update-components-actor__name, .feed-shared-actor__name, [class*="actor__name"]');
-      const author = authorEl ? authorEl.innerText.trim() : '';
+        seen.add(href);
 
-      const timeEl = el.querySelector('time, [class*="timestamp"], .feed-shared-actor__sub-description');
-      const dateRaw = timeEl
-        ? (timeEl.getAttribute('datetime') || timeEl.innerText.trim())
-        : '';
+        // Try to find a nearby timestamp
+        const card = a.closest('[data-urn], [class*="occludable"], [class*="entity-result"], [class*="saved"]') || a.parentElement;
+        const timeEl = card ? card.querySelector('time, [class*="timestamp"], [class*="time-ago"]') : null;
+        const dateRaw = timeEl ? (timeEl.getAttribute('datetime') || timeEl.innerText.trim()) : '';
 
-      const linkEl = el.querySelector("a[href*='/posts/'], a[href*='/feed/update/']");
-      const postUrl = linkEl ? linkEl.href : '';
+        const authorEl = card ? card.querySelector('[class*="actor__name"], [class*="author"], strong') : null;
+        const author = authorEl ? authorEl.innerText.trim() : '';
 
-      const links = [...el.querySelectorAll('a[href]')]
+        results.push({ url: href, dateRaw, author });
+    }
+    return results;
+}
+"""
+
+# ── JS: extract content from an open post page ───────────────────────────────
+EXTRACT_POST_JS = """
+() => {
+    const textEl = document.querySelector(
+        '.feed-shared-text, .update-components-text, [class*="commentary"], ' +
+        '.feed-shared-update-v2__description, [class*="attributed-text"]'
+    );
+    const text = textEl ? textEl.innerText.trim() : document.body.innerText.slice(0, 1500);
+
+    const authorEl = document.querySelector(
+        '.update-components-actor__name, .feed-shared-actor__name, ' +
+        '[class*="actor__name"], h1[class*="author"]'
+    );
+    const author = authorEl ? authorEl.innerText.trim() : '';
+
+    const timeEl = document.querySelector('time, [class*="timestamp"]');
+    const dateRaw = timeEl ? (timeEl.getAttribute('datetime') || timeEl.innerText.trim()) : '';
+
+    const articleTitle = (
+        document.querySelector('.feed-shared-article__title, [class*="article-title"], [class*="article__title"]') || {}
+    ).innerText?.trim() || '';
+
+    const links = [...document.querySelectorAll('a[href]')]
         .map(a => ({ text: a.innerText.trim().slice(0, 120), url: a.href }))
-        .filter(l => l.url && !l.url.includes('javascript:') && !l.url.includes('linkedin.com/in/'))
-        .filter((l, idx, arr) => arr.findIndex(x => x.url === l.url) === idx);
+        .filter(l =>
+            l.url &&
+            !l.url.startsWith('javascript') &&
+            !l.url.includes('linkedin.com/in/') &&
+            !l.url.includes('linkedin.com/company/') &&
+            !l.url.includes('/mynetwork') &&
+            !l.url.includes('/jobs') &&
+            !l.url.includes('/messaging')
+        )
+        .filter((l, i, arr) => arr.findIndex(x => x.url === l.url) === i)
+        .slice(0, 20);
 
-      const articleTitle = (el.querySelector('.feed-shared-article__title, [class*="article"] [class*="title"]') || {}).innerText?.trim() || '';
-
-      // grab the position (top of element) to help detect how far we've scrolled
-      const rect = el.getBoundingClientRect();
-      const absTop = rect.top + window.scrollY;
-
-      posts.push({ index: i, author, dateRaw, postUrl, text: text.slice(0, 1000), articleTitle, links, absTop });
-    } catch(e) {}
-  });
-
-  return posts;
+    return { text, author, dateRaw, articleTitle, links };
 }
 """
 
 # ── Parse fuzzy LinkedIn dates ────────────────────────────────────────────────
-def parse_linkedin_date(raw: str) -> datetime | None:
+def parse_date(raw: str):
     if not raw:
         return None
     raw = raw.strip().lower()
-
-    # ISO datetime
     try:
-        return datetime.fromisoformat(raw.replace("z", "+00:00").split("+")[0])
+        return datetime.fromisoformat(raw.replace("z", "").split("+")[0])
     except Exception:
         pass
-
     now = datetime.now()
-
     m = re.search(r"(\d+)\s*(minute|hour|day|week|month|year)s?\s*ago", raw)
     if m:
         n, unit = int(m.group(1)), m.group(2)
-        deltas = {
-            "minute": timedelta(minutes=n),
-            "hour": timedelta(hours=n),
-            "day": timedelta(days=n),
-            "week": timedelta(weeks=n),
-            "month": timedelta(days=n * 30),
-            "year": timedelta(days=n * 365),
-        }
-        return now - deltas.get(unit, timedelta(0))
-
-    # "Jan 5", "March 2023", etc.
-    for fmt in ("%b %d, %Y", "%B %d, %Y", "%b %d", "%B %d", "%b %Y", "%B %Y"):
+        return now - {"minute": timedelta(minutes=n), "hour": timedelta(hours=n),
+                      "day": timedelta(days=n), "week": timedelta(weeks=n),
+                      "month": timedelta(days=n*30), "year": timedelta(days=n*365)}[unit]
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%b %d", "%B %d"):
         try:
             d = datetime.strptime(raw, fmt)
-            if d.year == 1900:
-                d = d.replace(year=now.year)
-            return d
+            return d.replace(year=now.year) if d.year == 1900 else d
         except Exception:
             pass
-
     return None
 
-# ── Main agent loop ───────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 async def run():
-    print("\n🤖  LinkedIn Saved Posts Agent")
+    print("\n🤖  LinkedIn Saved Posts Agent v2")
     print("=" * 44)
-
     if not ANTHROPIC_API_KEY:
         print("❌  Set ANTHROPIC_API_KEY env var first.")
         sys.exit(1)
 
     cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-    print(f"📅  Collecting posts from the last {LOOKBACK_DAYS} days (since {cutoff.strftime('%b %d, %Y')})")
+    print(f"📅  Collecting posts since {cutoff.strftime('%b %d, %Y')}\n")
 
     async with async_playwright() as pw:
-        # Launch visible browser so you can log in
-        browser = await pw.chromium.launch(headless=False, slow_mo=50)
-        ctx = await browser.new_context(viewport={"width": 1280, "height": 900})
-        page = await ctx.new_page()
+        # ── Session cache: reuse cookies so login only happens once ────────
+        session_path = Path(SESSION_FILE)
+        ctx_kwargs   = {"viewport": {"width": 1280, "height": 900}}
+        if session_path.exists():
+            ctx_kwargs["storage_state"] = SESSION_FILE
+            print(f"🔑  Loaded saved session from {SESSION_FILE}")
 
-        # ── Step 1: navigate and wait for login ──────────────────────────────
-        print("\n🌐  Opening LinkedIn saved posts...")
-        await page.goto("https://www.linkedin.com/my-items/saved-posts/", wait_until="domcontentloaded")
-        await asyncio.sleep(3)
+        browser = await pw.chromium.launch(headless=False, slow_mo=30)
+        ctx     = await browser.new_context(**ctx_kwargs)
+        page    = await ctx.new_page()
 
-        # Check if we need to log in
-        ss = await screenshot_b64(page)
-        login_check = ask_claude_vision(
-            ss,
-            "Is this a LinkedIn login/auth page, or are we already viewing saved posts? "
-            "Reply with exactly 'LOGIN_NEEDED' or 'LOGGED_IN'."
-        )
+        # ── Login (only if no cached session or session expired) ────────────
+        print("🌐  Navigating to LinkedIn saved posts...")
+        await safe_goto(page, "https://www.linkedin.com/my-items/saved-posts/")
 
-        if "LOGIN_NEEDED" in login_check:
-            print("\n🔐  Please log in to LinkedIn in the browser window.")
-            print("    Press ENTER here when you're on the Saved Posts page...")
+        ss = await page.screenshot()
+        status = claude_vision(b64(ss),
+            "Is this a LinkedIn login page or are we already viewing saved posts? "
+            "Reply exactly: LOGIN_NEEDED or LOGGED_IN")
+
+        if "LOGIN_NEEDED" in status:
+            print("🔐  Please log in inside the browser window.")
+            print("    When you can see your saved posts, press ENTER here...")
             input()
-            await page.goto("https://www.linkedin.com/my-items/saved-posts/", wait_until="domcontentloaded")
-            await asyncio.sleep(3)
+            await safe_goto(page, "https://www.linkedin.com/my-items/saved-posts/")
+            # Save session so next run skips login entirely
+            await ctx.storage_state(path=SESSION_FILE)
+            print(f"💾  Session saved → {SESSION_FILE} (won't ask again)")
+        else:
+            # Refresh the cache in case tokens rotated
+            await ctx.storage_state(path=SESSION_FILE)
+            print(f"✅  Session valid. Refreshed {SESSION_FILE}")
 
-        print("✅  Logged in. Starting extraction...\n")
+        print("✅  On saved posts page. Starting...\n")
+        await asyncio.sleep(2)
 
-        # ── Step 2: scroll + extract loop ────────────────────────────────────
-        all_posts: dict[str, dict] = {}   # keyed by postUrl or index
-        scroll_step = 0
-        reached_cutoff = False
-        last_post_count = 0
-        stale_count = 0
+        # ── Collect + open each post ───────────────────────────────────────
+        all_posts   = []
+        seen_urls   = set()
+        stop        = False
+        scroll_pass = 0
+        empty_passes = 0
 
-        while scroll_step < MAX_SCROLL_STEPS and not reached_cutoff:
-            scroll_step += 1
+        while not stop and len(all_posts) < MAX_POSTS:
+            scroll_pass += 1
 
-            # Extract current DOM
-            posts = await page.evaluate(EXTRACT_JS)
+            links = await page.evaluate(COLLECT_LINKS_JS)
+            new_links = [l for l in links if l["url"] not in seen_urls]
+            print(f"📋  Pass {scroll_pass}: {len(new_links)} new links visible ({len(all_posts)} extracted so far)")
 
-            # Merge into all_posts (avoid duplicates)
-            for p in posts:
-                key = p.get("postUrl") or f"idx_{p['index']}"
-                if key not in all_posts:
-                    all_posts[key] = {**p, "scrapedAt": datetime.now().isoformat()}
-
-            new_total = len(all_posts)
-            print(f"  Step {scroll_step:03d} | {new_total} unique posts collected", end="\r")
-
-            # Check if newest posts are older than cutoff
-            dated = [p for p in all_posts.values() if p.get("dateRaw")]
-            parsed_dates = [(p, parse_linkedin_date(p["dateRaw"])) for p in dated]
-            valid = [(p, d) for p, d in parsed_dates if d]
-
-            if valid:
-                oldest_visible = min(d for _, d in valid)
-                if oldest_visible < cutoff:
-                    print(f"\n📅  Reached posts from {oldest_visible.strftime('%b %d, %Y')} — past our cutoff, stopping.")
-                    reached_cutoff = True
+            if not new_links:
+                empty_passes += 1
+                if empty_passes >= 4:
+                    print("⚠️   No more new links after scrolling. Done.")
                     break
-
-            # Stale check (no new posts after scrolling)
-            if new_total == last_post_count:
-                stale_count += 1
-                if stale_count >= 6:
-                    print("\n⚠️   No new posts loading. Assuming we've hit the end.")
-                    break
+                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                await asyncio.sleep(2.5)
+                continue
             else:
-                stale_count = 0
-            last_post_count = new_total
+                empty_passes = 0
 
-            # Scroll down
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 0.85)")
-            await asyncio.sleep(1.5)
-
-            # Every 15 steps, use Claude vision to confirm we're still on track
-            if scroll_step % 15 == 0:
-                ss = await screenshot_b64(page)
-                assessment = ask_claude_vision(
-                    ss,
-                    "You are helping scrape LinkedIn saved posts. Look at this screenshot. "
-                    "Are we still scrolling through the saved posts feed? Is there a 'no more posts' message? "
-                    "Is anything broken (CAPTCHA, login redirect, error)? "
-                    "Reply in one sentence starting with STATUS: OK | END_OF_FEED | ERROR."
-                )
-                print(f"\n  🧠 Claude says: {assessment}")
-                if "END_OF_FEED" in assessment or "ERROR" in assessment:
+            # ── Filter links: skip already-seen and past-cutoff cards ───────
+            to_fetch = []
+            for link_info in new_links:
+                if len(all_posts) + len(to_fetch) >= MAX_POSTS:
+                    stop = True
                     break
+                url = link_info["url"]
+                seen_urls.add(url)
+                card_date = parse_date(link_info.get("dateRaw", ""))
+                if card_date and card_date < cutoff:
+                    print(f"  ⏭️   Card date '{link_info.get('dateRaw')}' past cutoff — stopping")
+                    stop = True
+                    break
+                to_fetch.append(link_info)
 
-        print(f"\n\n✅  Scroll complete. {len(all_posts)} raw posts collected.")
+            # ── Parallel fetch: PARALLEL_TABS tabs at a time ─────────────
+            async def fetch_one(link_info, idx):
+                url = link_info["url"]
+                post_page = await ctx.new_page()
+                try:
+                    await safe_goto(post_page, url, timeout=15000)
+                    data = await post_page.evaluate(EXTRACT_POST_JS)
+                    if not data["author"] and link_info.get("author"):
+                        data["author"] = link_info["author"]
+                    if not data["dateRaw"] and link_info.get("dateRaw"):
+                        data["dateRaw"] = link_info["dateRaw"]
+                    parsed_date = parse_date(data["dateRaw"])
+                    if parsed_date and parsed_date < cutoff:
+                        return None   # signal: past cutoff
+                    result = {
+                        "index":        idx,
+                        "postUrl":      url,
+                        "author":       data["author"],
+                        "dateRaw":      data["dateRaw"],
+                        "parsedDate":   parsed_date.isoformat() if parsed_date else None,
+                        "text":         data["text"][:1000],
+                        "articleTitle": data["articleTitle"],
+                        "links":        data["links"],
+                        "scrapedAt":    datetime.now().isoformat(),
+                    }
+                    print(f"  ✅  [{idx}] {data['author'] or 'unknown'} · {data['dateRaw'] or 'no date'} · {len(data['links'])} links")
+                    return result
+                except Exception as e:
+                    print(f"  ❌  [{idx}] {url[:55]}: {e}")
+                    return None
+                finally:
+                    await post_page.close()
+
+            for batch_start in range(0, len(to_fetch), PARALLEL_TABS):
+                batch = to_fetch[batch_start : batch_start + PARALLEL_TABS]
+                base_idx = len(all_posts) + 1
+                print(f"  🚀  Launching {len(batch)} tabs in parallel...")
+                results = await asyncio.gather(*[
+                    fetch_one(link_info, base_idx + i)
+                    for i, link_info in enumerate(batch)
+                ])
+                for r in results:
+                    if r is None:
+                        stop = True
+                    else:
+                        all_posts.append(r)
+                if stop:
+                    break
+                await page.bring_to_front()
+                await asyncio.sleep(0.5)
+
+            # Scroll saved-posts list to load more cards
+            if not stop:
+                prev_h = await page.evaluate("document.body.scrollHeight")
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(2.5)
+                new_h = await page.evaluate("document.body.scrollHeight")
+                if new_h == prev_h:
+                    print("📄  Reached end of saved posts list.")
+                    break
 
         await browser.close()
 
-    # ── Step 3: filter to cutoff window ──────────────────────────────────────
-    posts_list = list(all_posts.values())
-    filtered = []
-    undated = []
-    for p in posts_list:
-        d = parse_linkedin_date(p.get("dateRaw", ""))
-        if d:
-            p["parsedDate"] = d.isoformat()
-            if d >= cutoff:
-                filtered.append(p)
-        else:
-            undated.append(p)   # include undated ones since we can't exclude confidently
+    print(f"\n✅  Done. {len(all_posts)} posts collected.")
 
-    # Include undated posts (can't tell if they're old)
-    combined = filtered + undated
-    print(f"📊  {len(filtered)} posts within {LOOKBACK_DAYS} days + {len(undated)} undated posts")
+    # Cache raw posts immediately — so a cleaning crash never loses your scrape
+    raw_cache = OUTPUT_FILE.replace(".json", "_raw.json")
+    Path(raw_cache).write_text(
+        json.dumps(all_posts, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"💾  Raw cache → {raw_cache}")
 
-    # ── Step 4: AI clean + enrich ─────────────────────────────────────────────
-    print("\n🧹  Cleaning + enriching with Claude...")
-    cleaned = await clean_posts(combined)
+    if all_posts:
+        print("🧹  Cleaning + categorising with Claude...")
+        all_posts = await clean_posts(all_posts)
 
-    # ── Step 5: Save ──────────────────────────────────────────────────────────
-    Path(OUTPUT_FILE).write_text(json.dumps(cleaned, indent=2, ensure_ascii=False))
-    print(f"\n💾  Saved to {OUTPUT_FILE}")
-    print(f"    {len(cleaned)} posts ready. Open linkedin_viewer.jsx to browse them!\n")
-
-    return cleaned
+    Path(OUTPUT_FILE).write_text(
+        json.dumps(all_posts, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"💾  Cleaned → {OUTPUT_FILE}")
+    print(f"    Load into linkedin_viewer.jsx to browse.\n")
+    return all_posts
 
 
 # ── AI cleaner ────────────────────────────────────────────────────────────────
-async def clean_posts(posts: list[dict]) -> list[dict]:
-    """
-    Sends posts in batches to Claude for cleaning:
-    - Normalise dates
-    - Extract/clean external URLs (strip LinkedIn tracking)
-    - Tag post type (job opportunity, article, tool, event, other)
-    - Pull out a one-line summary
-    """
-    BATCH = 15
-    cleaned_all = []
-
+async def clean_posts(posts: list) -> list:
+    BATCH = 10
+    out   = []
     for i in range(0, len(posts), BATCH):
-        batch = posts[i: i + BATCH]
-        batch_json = json.dumps(
-            [{
-                "index": p.get("index"),
-                "author": p.get("author"),
-                "dateRaw": p.get("dateRaw"),
-                "text": p.get("text", "")[:500],
-                "articleTitle": p.get("articleTitle"),
-                "links": [l["url"] for l in p.get("links", [])[:8]],
-                "postUrl": p.get("postUrl"),
-            } for p in batch],
-            indent=2
+        batch = posts[i:i+BATCH]
+        payload = json.dumps([{
+            "index":        p["index"],
+            "author":       p.get("author"),
+            "dateRaw":      p.get("dateRaw"),
+            "text":         p.get("text","")[:400],
+            "articleTitle": p.get("articleTitle"),
+            "links":        [l["url"] for l in p.get("links",[])[:6]],
+            "postUrl":      p.get("postUrl"),
+        } for p in batch], indent=2)
+
+        r = client.messages.create(
+            model=MODEL, max_tokens=3000,
+            messages=[{"role": "user", "content": f"""Clean these LinkedIn posts. Return a JSON array — one object per post — with:
+- index, author, postUrl  (unchanged from input)
+- date: ISO date string (best guess from dateRaw, or null)
+- summary: one punchy sentence about what this post is about
+- category: job_opportunity | article | tool | event | person | other
+- externalLinks: clean URLs that go outside LinkedIn (strip tracking params)
+
+Return ONLY valid JSON, no markdown fences, no explanation.
+
+{payload}"""}],
         )
-
-        prompt = f"""You are cleaning LinkedIn saved post data. For each post, return a JSON array with one object per post containing:
-- index: same as input
-- author: cleaned name
-- date: best ISO date guess from dateRaw (or null)
-- summary: one punchy sentence summarising what this post is about
-- category: one of [job_opportunity, article, tool, event, person, other]
-- externalLinks: array of URLs that go outside LinkedIn (strip tracking params, keep readable)
-- postUrl: same as input
-
-Return ONLY valid JSON array, no markdown, no explanation.
-
-Input:
-{batch_json}"""
-
-        resp = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = resp.content[0].text.strip()
-
-        # Strip markdown fences if present
+        raw = r.content[0].text.strip()
         raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("```").strip()
-
         try:
-            batch_cleaned = json.loads(raw)
-            # Merge back original links list
-            for item in batch_cleaned:
-                orig = next((p for p in batch if p.get("index") == item.get("index")), {})
-                item["allLinks"] = orig.get("links", [])
-                item["imageUrl"] = orig.get("imageUrl", "")
-            cleaned_all.extend(batch_cleaned)
-        except json.JSONDecodeError as e:
-            print(f"  ⚠️  JSON parse error on batch {i//BATCH + 1}: {e} — keeping raw")
-            cleaned_all.extend(batch)
-
-        print(f"  Cleaned batch {i//BATCH + 1}/{(len(posts)-1)//BATCH + 1}", end="\r")
-
+            cleaned = json.loads(raw)
+            for item in cleaned:
+                orig = next((p for p in batch if p["index"] == item.get("index")), {})
+                item["allLinks"]  = orig.get("links", [])
+                item["text"]      = orig.get("text", "")
+                item["scrapedAt"] = orig.get("scrapedAt", "")
+            out.extend(cleaned)
+        except Exception as e:
+            print(f"  ⚠️  Parse error batch {i//BATCH+1}: {e} — keeping raw")
+            out.extend(batch)
+        print(f"  Cleaned {min(i+BATCH, len(posts))}/{len(posts)} posts", end="\r")
     print()
-    return cleaned_all
+    return out
+
+
+
+# ── Re-clean from cache (skip scraping) ──────────────────────────────────────
+async def clean_from_cache(cache_file: str):
+    """
+    Run just the cleaning step on an existing _raw.json file.
+    Usage: edit the bottom of this file to call clean_from_cache("yourfile_raw.json")
+    """
+    print(f"📂  Loading cache: {cache_file}")
+    posts = json.loads(Path(cache_file).read_text(encoding="utf-8"))
+    print(f"   {len(posts)} posts loaded.")
+    cleaned = await clean_posts(posts)
+    out = cache_file.replace("_raw.json", "_cleaned.json")
+    Path(out).write_text(json.dumps(cleaned, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"💾  Saved → {out}")
+    return cleaned
 
 
 if __name__ == "__main__":
