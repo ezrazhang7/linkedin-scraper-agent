@@ -1,0 +1,30 @@
+{
+  "name": "linkedin-scraper-agent",
+  "version": "1.0.0",
+  "description": "An AI agent (Playwright + Claude vision) that opens your browser, scrolls your LinkedIn saved posts, extracts everything from the last 30 days, and cleans it into structured JSON.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1", 
+      "dev": "vite",
+  "build": "vite build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhangyaxin742/linkedin-scraper-agent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/zhangyaxin742/linkedin-scraper-agent/issues"
+  },
+  "homepage": "https://github.com/zhangyaxin742/linkedin-scraper-agent#readme",
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.4",
+    "vite": "^7.3.1"
+  }
+}
