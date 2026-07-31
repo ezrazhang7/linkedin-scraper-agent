@@ -54,9 +54,13 @@ Each post in the JSON looks like:
 }
 ```
 
-## View the results
+## Export to Excel
 
-Load the JSON into `linkedin_viewer.jsx` (open it as an artifact in Claude) for a searchable, filterable UI with proper new-tab links.
+`json_to_xlsx.py` converts the output JSON into a formatted spreadsheet for easier browsing and filtering:
+
+```bash
+python json_to_xlsx.py linkedin_saved_YYYYMMDD_HHMMSS.json
+```
 
 ## Troubleshooting
 
