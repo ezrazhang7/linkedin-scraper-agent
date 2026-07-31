@@ -1,0 +1,12 @@
+# secrets & sessions
+linkedin_session.json
+*.session.json
+.env
+.env.local
+
+# dependencies
+node_modules/
+
+# scraped output (contains data about real people)
+linkedin_saved_*.json
+*.xlsx
